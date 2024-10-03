@@ -29,6 +29,8 @@ install(DIRECTORY
             cpp/whisper_speech_recognition
             cpp/stable_diffusion
             cpp/lora_greedy_causal_lm
+        #     cpp/visual_language_chat
+        #     cpp/continuous_batching_accuracy
         DESTINATION samples/cpp COMPONENT cpp_samples_genai)
 
 install(DIRECTORY
