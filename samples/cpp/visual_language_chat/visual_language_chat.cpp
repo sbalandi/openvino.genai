@@ -31,13 +31,20 @@ int main(int argc, char* argv[]) try {
     }
     pipe.generate(
         prompt,
-        ov::genai::image(std::move(image)),
+        // ov::genai::image(std::move(image)),
+        ov::genai::generation_config(ov::genai::beam_search()),
+        // ov::genai::generation_config(ov::genai::greedy()),
+        // ov::genai::generation_config(ov::genai::multinomial()),
         ov::genai::streamer(print_subword)
     );
     std::cout << "\n----------\n"
         "question:\n";
     while (std::getline(std::cin, prompt)) {
-        pipe.generate(prompt, ov::genai::streamer(print_subword));
+        pipe.generate(prompt,
+        	        ov::genai::generation_config(ov::genai::beam_search()),
+                    // ov::genai::generation_config(ov::genai::greedy()),
+                    // ov::genai::generation_config(ov::genai::multinomial()),
+                      ov::genai::streamer(print_subword));
         std::cout << "\n----------\n"
             "question:\n";
     }

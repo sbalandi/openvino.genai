@@ -230,6 +230,22 @@ Sampler::GroupBeamSearcher::GroupBeamSearcher(SequenceGroup::Ptr sequence_group,
     }
 }
 
+
+std::vector<int32_t> Sampler::GroupBeamSearcher::get_beam_idxs() {
+    std::vector<int32_t> next_beams;
+
+    for (Group& group : m_groups) {
+        if (!group.done) {
+            for (Beam& beam : group.ongoing) {
+                next_beams.push_back(beam.m_global_beam_idx);
+            }
+        }
+    }
+
+    return next_beams;
+}
+
+
 void Sampler::GroupBeamSearcher::select_next_tokens(const ov::Tensor& logits, SamplerOutput& sampler_output) {
     assert(m_parameters.num_beams % m_parameters.num_beam_groups == 0 &&
         "number of beams should be divisible by number of groups");
@@ -558,6 +574,16 @@ std::vector<int64_t> Sampler::_try_finish_generation(SequenceGroup::Ptr & sequen
         }
     }
     return dropped_seq_ids;
+}
+
+
+std::vector<int32_t> Sampler::get_beam_idxs(uint64_t request_id) {
+    std::vector<int32_t> beams;
+    if (m_beam_search_info.find(request_id) != m_beam_search_info.end()) {
+        GroupBeamSearcher beam_searcher = m_beam_search_info.at(request_id);
+        std::vector<int32_t> beams = beam_searcher.get_beam_idxs();
+    }
+    return beams;
 }
 
 
