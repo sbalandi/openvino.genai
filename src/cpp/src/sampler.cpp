@@ -578,12 +578,11 @@ std::vector<int64_t> Sampler::_try_finish_generation(SequenceGroup::Ptr & sequen
 
 
 std::vector<int32_t> Sampler::get_beam_idxs(uint64_t request_id) {
-    std::vector<int32_t> beams;
-    if (m_beam_search_info.find(request_id) != m_beam_search_info.end()) {
-        GroupBeamSearcher beam_searcher = m_beam_search_info.at(request_id);
-        std::vector<int32_t> beams = beam_searcher.get_beam_idxs();
+    auto beam_searcher = m_beam_search_info.find(request_id);
+    if (m_beam_search_info.find(request_id) == m_beam_search_info.end()) {
+        return { 0 };
     }
-    return beams;
+    return beam_searcher->second.get_beam_idxs();
 }
 
 

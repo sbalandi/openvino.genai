@@ -3,17 +3,13 @@
 
 #include "openvino/genai/vlm_pipeline.hpp"
 #include "openvino/genai/tokenizer.hpp"
-#include "vlm_sampling.hpp"
+#include "sampler.hpp"
 #include "clip.hpp"
 #include <openvino/openvino.hpp>
 #include "../src/text_callback_streamer.hpp"
 #include "utils.hpp"
 #include <optional>
 #include <random>
-
-#include "sampler.hpp"
-
-#include "debug_utils.hpp"
 
 using namespace ov::genai;
 
@@ -30,57 +26,6 @@ struct Args {
     float temp = 0.95f;
     float repeat_penalty = 1.0f;
 };
-
-int64_t get_out_token_id(const std::vector<int>& input_ids, float* logits, size_t vocab_size, Args args) {
-    int64_t out_token;
-
-    // logits pre-process
-    if (args.repeat_penalty != 1.f) {
-        sampling_repetition_penalty(logits, logits + vocab_size, input_ids, args.repeat_penalty);
-    }
-
-    if (args.do_sample)
-    {
-        if (args.temp > 0) {
-            sampling_temperature(logits, logits + vocab_size, args.temp);
-        }
-
-        std::vector<TokenIdScore> token_scores(vocab_size);
-        for (int i = 0; i < vocab_size; i++) {
-            token_scores[i] = TokenIdScore(i, logits[i]);
-        }
-
-        // top_k sampling
-        if (0 < args.top_k && args.top_k < (int)token_scores.size()) {
-            sampling_top_k(token_scores.data(), token_scores.data() + args.top_k,
-                token_scores.data() + token_scores.size());
-            token_scores.resize(args.top_k);
-        }
-
-        // top_p sampling
-        if (0.f < args.top_p && args.top_p < 1.f) {
-            auto pos = sampling_top_p(token_scores.data(), token_scores.data() + token_scores.size(), args.top_p);
-            token_scores.resize(pos - token_scores.data());
-        }
-
-        // sample next token
-        sampling_softmax_inplace(token_scores.data(), token_scores.data() + token_scores.size());
-        for (size_t i = 0; i < token_scores.size(); i++) {
-            logits[i] = token_scores[i].score;
-        }
-
-        thread_local std::random_device rd;
-        thread_local std::mt19937 gen(rd());
-
-        std::discrete_distribution<> dist(logits, logits + token_scores.size());
-        out_token = token_scores[dist(gen)].id;
-    }
-    else {
-        out_token = std::max_element(logits, logits + vocab_size) - logits;
-    }
-
-    return out_token;
-}
 
 ov::Tensor process_prompt(ov::InferRequest& embedding, const ov::Tensor& prompt, float scale_emb) {
     embedding.set_input_tensor(prompt);
@@ -298,90 +243,6 @@ ov::Tensor resample(VLMPipeline& pipe, const ov::Tensor& encoded_image, const st
     pipe.m_resampler.infer();
     return pipe.m_resampler.get_output_tensor();  // [N, query_num, new_hidden_size]
 }
-}
-
-
-void forward_embedings_and_lm(SequenceGroup::CPtr sequence_group, ov::InferRequest& embedding, ov::InferRequest& language, const VLMConfig m_vlm_config, const std::shared_ptr<Sampler> sampler) {
-    // compute aggregated values
-    size_t num_sequences = sequence_group->num_running_seqs();
-    size_t batch_size_in_sequences = num_sequences;
-    size_t total_num_tokens = sequence_group->get_num_scheduled_tokens() * num_sequences;
-    size_t total_num_blocks = sequence_group->get_num_blocks() * num_sequences;
-    size_t max_context_len_val = std::max(max_context_len_val, sequence_group->get_context_len());
-
-    ov::Tensor
-        input_ids(ov::element::i64, {total_num_tokens, 1}),
-        position_ids(ov::element::i64, {total_num_tokens, 1}),
-        beam_idx(ov::element::i32, { total_num_tokens });
-
-    // get raw pointers to copy to
-    int64_t
-        * input_ids_data = input_ids.data<int64_t>(),
-        * position_ids_data = position_ids.data<int64_t>();
-    int32_t
-        * beam_idx_data = beam_idx.data<int32_t>();
-
-    std::vector<Sequence::CPtr> running_sequences = sequence_group->get_running_sequences();
-    size_t num_running_sequences = running_sequences.size();
-    size_t num_scheduled_tokens = sequence_group->get_num_scheduled_tokens();
-    size_t group_position_id = sequence_group->get_num_processed_tokens();
-
-    // spec: In case of multiple input tokens for current sequence (prompt_len > 1),
-    // context_len corresponds to first token within subgroup of scheduled tokens
-    size_t group_context_len = group_position_id;
-
-    for (size_t seq_id = 0; seq_id < num_running_sequences; ++seq_id) {
-        Sequence::CPtr sequence = running_sequences[seq_id];
-
-        for (size_t token_id = 0, position_id = group_position_id; token_id < num_scheduled_tokens; ++token_id, ++position_id) {
-            // compute token for current sequence
-            input_ids_data[token_id] = position_id < sequence_group->get_prompt_len() ?
-                sequence_group->get_prompt_ids()[position_id] :
-                sequence->get_generated_ids()[position_id - sequence_group->get_prompt_len()];
-
-            position_ids_data[token_id] = position_id;
-        }
-
-        // apply strides to shift to a next sequence
-        input_ids_data += num_scheduled_tokens;
-        position_ids_data += num_scheduled_tokens;
-    }
-
-    embedding.set_input_tensor(input_ids);
-
-    embedding.infer();
-    const ov::Tensor& embed_prompt_tensor = embedding.get_output_tensor();
-    float* embed_data = embed_prompt_tensor.data<float>();
-    for (auto idx = 0; idx < embed_prompt_tensor.get_size(); idx++) {
-        embed_data[idx] = embed_data[idx] * m_vlm_config.scale_emb;
-    }
-
-    language.set_tensor("inputs_embeds", embed_prompt_tensor);
-
-    language.get_tensor("attention_mask").set_shape({ total_num_tokens, language.get_tensor("attention_mask").get_shape()[1] + 1 });
-    std::fill_n(language.get_tensor("attention_mask").data<int64_t>(), language.get_tensor("attention_mask").get_size(), 1);
-
-    language.set_tensor("position_ids", position_ids);
-    std::vector<int32_t> beam_idxs = sampler->get_beam_idxs(sequence_group->get_request_id());
-    if (beam_idxs.empty()) {
-        for (size_t i = 0; i < num_sequences; i++) {
-            beam_idx_data[i] = 0;
-        }
-    } else {
-        for (size_t i = 0; i < beam_idxs.size(); i++) {
-            beam_idx_data[i] = beam_idxs.at(i);
-        }
-    }
-    language.set_tensor("beam_idx", beam_idx);
-
-    // print_tensor("input_ids", input_ids);
-    // print_tensor("position_ids", position_ids);
-    // print_tensor("attention_mask", language.get_tensor("attention_mask"));
-    // print_tensor("beam_idx", beam_idx);
-
-    language.infer();
-}
-
 
 EncodedGenerationResult get_lm_encoded_results(
     ov::InferRequest& language,
@@ -389,7 +250,7 @@ EncodedGenerationResult get_lm_encoded_results(
     ov::Tensor inputs_embeds,
     const VLMConfig m_vlm_config,
     const std::shared_ptr<StreamerBase> streamer_ptr,
-    const std::shared_ptr<Sampler> sampler,
+    Sampler& sampler,
     std::vector<SequenceGroup::Ptr> requests
 ) {
     SequenceGroup::Ptr request = requests.back();
@@ -412,26 +273,77 @@ EncodedGenerationResult get_lm_encoded_results(
     int64_t sequence_len = language.get_tensor("logits").get_shape().at(1);
     request->schedule_tokens(sequence_len);
 
-    SamplerOutput sampler_output = sampler->sample(requests, language.get_tensor("logits"));
+    SamplerOutput sampler_output = sampler.sample(requests, language.get_tensor("logits"));
 
     language.get_tensor("inputs_embeds").set_shape({BATCH_SIZE, 1, m_vlm_config.hidden_size});
     language.get_tensor("position_ids").set_shape({ BATCH_SIZE, 1 });
 
-
     while (!request->has_finished()) {
         request->schedule_tokens(1);
+        size_t num_sequences = request->num_running_seqs();
+        size_t total_num_tokens = request->get_num_scheduled_tokens() * num_sequences;
 
-        forward_embedings_and_lm(request, embedding, language, m_vlm_config, sampler);
+        ov::Tensor
+            input_ids(ov::element::i64, {total_num_tokens, 1}),
+            position_ids(ov::element::i64, {total_num_tokens, 1}),
+            beam_idx(ov::element::i32, { total_num_tokens });
+
+        int64_t
+            * input_ids_data = input_ids.data<int64_t>(),
+            * position_ids_data = position_ids.data<int64_t>();
+
+        size_t num_scheduled_tokens = request->get_num_scheduled_tokens();
+        size_t group_position_id = request->get_num_processed_tokens();
+        for (Sequence::Ptr& sequence : request->get_running_sequences()) {
+            for (size_t token_id = 0, position_id = group_position_id; token_id < num_scheduled_tokens; ++token_id, ++position_id) {
+                // compute token for current sequence
+                input_ids_data[token_id] = position_id < request->get_prompt_len() ?
+                    request->get_prompt_ids()[position_id] :
+                    sequence->get_generated_ids()[position_id - request->get_prompt_len()];
+
+                position_ids_data[token_id] = position_id;
+            }
+            // apply strides to shift to a next sequence
+            input_ids_data += num_scheduled_tokens;
+            position_ids_data += num_scheduled_tokens;
+        }
+
+        embedding.set_input_tensor(input_ids);
+
+        embedding.infer();
+        const ov::Tensor& embed_prompt_tensor = embedding.get_output_tensor();
+        float* embed_data = embed_prompt_tensor.data<float>();
+        for (auto idx = 0; idx < embed_prompt_tensor.get_size(); idx++) {
+            embed_data[idx] = embed_data[idx] * m_vlm_config.scale_emb;
+        }
+
+        language.set_tensor("inputs_embeds", embed_prompt_tensor);
+
+        language.get_tensor("attention_mask").set_shape({ total_num_tokens, language.get_tensor("attention_mask").get_shape()[1] + 1 });
+        std::fill_n(language.get_tensor("attention_mask").data<int64_t>(), language.get_tensor("attention_mask").get_size(), 1);
+
+        language.set_tensor("position_ids", position_ids);
+
+        std::vector<int32_t> beam_idxs = sampler.get_beam_idxs(request->get_request_id());
+        int32_t *beam_idx_data = beam_idx.data<int32_t>();
+        if (total_num_tokens > beam_idxs.size()) {
+            std::fill_n(beam_idx_data, total_num_tokens, 0);
+        } else {
+            copy(beam_idxs.begin(), beam_idxs.end(), beam_idx_data);
+        }
+        language.set_tensor("beam_idx", beam_idx);
+
+        language.infer();
 
         if (streamer_ptr) {
-            // first sequences
+            // first sequence
             int64_t out_token = request.get()->operator[](0)->get_generated_ids().back();
             if (streamer_ptr->put(out_token)) {
                 break;
             }
         }
 
-        sampler_output = sampler->sample(requests, language.get_tensor("logits"));
+        sampler_output = sampler.sample(requests, language.get_tensor("logits"));
     }
 
     if (streamer_ptr) {
@@ -455,6 +367,7 @@ EncodedGenerationResult get_lm_encoded_results(
 
     return result;
 }
+} // anonymous
 
 
 class ov::genai::VLMPipeline::VLMPipelineImpl {
@@ -529,6 +442,8 @@ DecodedResults VLMPipeline::generate(
     }
     images_prompt += prompt;
     ov::Tensor encoded_input;
+    ov::Tensor new_chat_tokens;
+    size_t prev_tokens_num = 0;
     if (m_is_chat_conversation) {
         // KV cache in model already contains prompts and answers from previous iterations.
         // So only new prompt wrapped into chat template to be sent into model. Tokenizer always returns
@@ -541,7 +456,7 @@ DecodedResults VLMPipeline::generate(
         m_history.push_back({{"role", "user"}, {"content", images_prompt}});
         constexpr bool add_generation_prompt = true;
         std::string new_templated_chat_history = m_tokenizer.apply_chat_template(m_history, add_generation_prompt);
-        ov::Tensor new_chat_tokens = m_tokenizer.encode(new_templated_chat_history).input_ids;
+        new_chat_tokens = m_tokenizer.encode(new_templated_chat_history).input_ids;
         if (0 == m_language.get_tensor("attention_mask").get_shape().at(1)) {
             encoded_input = new_chat_tokens;
         } else {
@@ -551,6 +466,7 @@ DecodedResults VLMPipeline::generate(
             encoded_input = utils::subtract_chat_tokenized_inputs(
                 {new_chat_tokens}, prev_chat_tokens
             ).input_ids;
+            prev_tokens_num = prev_chat_tokens.input_ids.get_size();
         }
         m_templated_chat_history = std::move(new_templated_chat_history);
     } else {
@@ -608,13 +524,14 @@ DecodedResults VLMPipeline::generate(
             }
         }
     }
-    
-    std::shared_ptr<Sampler> sampler = std::make_shared<Sampler>(m_tokenizer);
+
+    Sampler sampler = Sampler(m_tokenizer);
 
     std::vector<SequenceGroup::Ptr> requests;
-    auto attention_size = m_language.get_tensor("attention_mask").get_size();	    // request_id, input_ids, generation_config, block_size, enable_prefix_caching
+    // request_id, input_ids, generation_config, block_size, enable_prefix_caching
     // now we have one prompt as input, so we need one request
-    SequenceGroup::Ptr sequence_group = std::make_shared<SequenceGroup>(0, encoded_input, generation_config, 1, false);
+    SequenceGroup::Ptr sequence_group = std::make_shared<SequenceGroup>(0, prev_tokens_num == 0 ? encoded_input : new_chat_tokens, generation_config, 1, false);
+    sequence_group->update_processed_tokens_num(prev_tokens_num);
     sequence_group->set_sequence_group_ptr(sequence_group);
     requests.push_back(sequence_group);
 
@@ -631,6 +548,10 @@ DecodedResults VLMPipeline::generate(
             return std::shared_ptr<StreamerBase>{nullptr};
         },
     }, streamer);
+
+    if ((!(generation_config.is_greedy_decoding() || generation_config.is_multinomial())) && streamer_ptr) {
+        OPENVINO_THROW("Currently streaming is possible only for greedy or multinomial decoding");
+    }
 
     EncodedGenerationResult encoded_result = get_lm_encoded_results(m_language, m_embedding, inputs_embeds, m_vlm_config, streamer_ptr, sampler, requests);
 
@@ -678,10 +599,6 @@ DecodedResults VLMPipeline::generate(
     // If eos_token_id was not provided, take value
     if (config.eos_token_id == -1)
         config.set_eos_token_id(m_tokenizer.get_eos_token_id());
-
-    // if (is_chat_conversation && config.num_return_sequences > 1) {
-    //     config.num_return_sequences = 1;
-    // }
 
     return generate(
         prompt,
