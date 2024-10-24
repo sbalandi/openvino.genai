@@ -41,6 +41,19 @@ protected:
 public:
     virtual ov::Tensor get_inputs_embeds(const std::string& prompt, const std::vector<ov::Tensor>& images) = 0;
 
+    ov::Tensor get_inputs_embeds(ov::Tensor input_ids) {
+        m_embedding.set_input_tensor(input_ids);
+
+        m_embedding.infer();
+        const ov::Tensor& embed_prompt_tensor = m_embedding.get_output_tensor();
+        float* embed_data = embed_prompt_tensor.data<float>();
+        for (auto idx = 0; idx < embed_prompt_tensor.get_size(); idx++) {
+            embed_data[idx] = embed_data[idx] * m_vlm_config.scale_emb;
+        }
+
+        return embed_prompt_tensor;
+    }
+
     ov::InferRequest get_embedding_model() const {
         return m_embedding;
     }
@@ -975,6 +988,10 @@ InputsEmbedder::InputsEmbedder(const VLMConfig& vlm_config,
 
 ov::Tensor InputsEmbedder::get_inputs_embeds(const std::string& prompt, const std::vector<ov::Tensor>& images) {
     return m_impl->get_inputs_embeds(prompt, images);
+}
+
+ov::Tensor InputsEmbedder::get_inputs_embeds(ov::Tensor input_ids) {
+    return m_impl->get_inputs_embeds(input_ids);
 }
 
 ov::InferRequest InputsEmbedder::get_embedding_model() const {

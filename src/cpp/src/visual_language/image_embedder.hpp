@@ -24,6 +24,9 @@ public:
     // compute input embedding for prompt and multiple images
     ov::Tensor get_inputs_embeds(const std::string& prompt, const std::vector<ov::Tensor>& images);
 
+    // compute input embedding for next token
+    ov::Tensor get_inputs_embeds(ov::Tensor input_ids);
+
     // returns embedding model which converts token_id(s) to embedding vectors
     ov::InferRequest get_embedding_model() const;
 
@@ -36,7 +39,6 @@ public:
     void update_chat_history(const std::string& decoded_results);
     // finishes chat and clears a chat history 
     void finish_chat();
-
 private:
     class IInputsEmbedder;
     std::shared_ptr<IInputsEmbedder> m_impl;

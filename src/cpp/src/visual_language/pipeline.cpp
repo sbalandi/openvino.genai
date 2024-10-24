@@ -25,9 +25,8 @@ constexpr size_t BATCH_SIZE = 1;
 
 EncodedGenerationResult get_lm_encoded_results(
     ov::InferRequest& language,
-    ov::InferRequest& embedding,
+    const std::shared_ptr<InputsEmbedder>& embedder,
     const ov::Tensor& inputs_embeds,
-    const VLMConfig& m_vlm_config,
     const std::shared_ptr<StreamerBase>& streamer_ptr,
     Sampler& sampler,
     std::vector<SequenceGroup::Ptr> requests
@@ -54,7 +53,8 @@ EncodedGenerationResult get_lm_encoded_results(
 
     sampler.sample(requests, language.get_tensor("logits"));
 
-    language.get_tensor("inputs_embeds").set_shape({BATCH_SIZE, 1, m_vlm_config.hidden_size});
+    auto hidden_size = embedder->get_embedding_model().get_output_tensor().get_shape()[2];
+    language.get_tensor("inputs_embeds").set_shape({BATCH_SIZE, 1, hidden_size});
     language.get_tensor("position_ids").set_shape({ BATCH_SIZE, 1 });
 
     while (!request->has_finished()) {
@@ -87,14 +87,7 @@ EncodedGenerationResult get_lm_encoded_results(
             position_ids_data += num_scheduled_tokens;
         }
 
-        embedding.set_input_tensor(input_ids);
-
-        embedding.infer();
-        const ov::Tensor& embed_prompt_tensor = embedding.get_output_tensor();
-        float* embed_data = embed_prompt_tensor.data<float>();
-        for (auto idx = 0; idx < embed_prompt_tensor.get_size(); idx++) {
-            embed_data[idx] = embed_data[idx] * m_vlm_config.scale_emb;
-        }
+        const ov::Tensor& embed_prompt_tensor = embedder->get_inputs_embeds(input_ids);
 
         language.set_tensor("inputs_embeds", embed_prompt_tensor);
 
@@ -238,7 +231,7 @@ public:
         OPENVINO_ASSERT((generation_config.is_greedy_decoding() || generation_config.is_multinomial() || !streamer_ptr),
                         "Currently streaming is possible only for greedy or multinomial decoding");
 
-        EncodedGenerationResult encoded_result = get_lm_encoded_results(m_language, m_embedding, inputs_embeds, m_vlm_config, streamer_ptr, sampler, requests);
+        EncodedGenerationResult encoded_result = get_lm_encoded_results(m_language, m_inputs_embedder, inputs_embeds, streamer_ptr, sampler, requests);
 
         DecodedResults decoded;
         for (size_t idx = 0; idx < encoded_result.m_generation_ids.size(); ++idx) {
