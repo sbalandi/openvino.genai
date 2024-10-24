@@ -12,20 +12,15 @@
 #include "lm_encoding.hpp"
 #include "openvino/genai/perf_metrics.hpp"
 
+#include "debug_utils.hpp"
+
+#include "utils.hpp"
 
 namespace ov {
 namespace genai {
 
-// void reset_all_inputs_to_empty_tensors(ov::InferRequest& request) {
-//     request.set_tensor("input_ids", ov::Tensor(ov::element::i64, {0, 0}));
-//     request.set_tensor("beam_idx", ov::Tensor(ov::element::i32, {0}));
-//     if (request.get_compiled_model().inputs().size() == 4)
-//         request.set_tensor("position_ids", ov::Tensor(ov::element::i64, {0, 0}));
-// }
-
-
 EncodedResults get_lm_encoded_results(
-    ov::InferRequest& m_model_runner,
+    ov::InferRequest& m_llm,
     const ov::Tensor& input_ids,
     ov::Tensor attention_mask,
     const std::shared_ptr<StreamerBase>& streamer_ptr,
@@ -33,8 +28,8 @@ EncodedResults get_lm_encoded_results(
     std::vector<SequenceGroup::Ptr> sequence_groups,
     std::optional<ov::Tensor> position_ids,
     std::optional<ov::InferRequest> m_embedding,
-    std::optional<size_t> hidden_size,
-    std::optional<float> scale_emb
+    std::optional<float> scale_emb,
+    std::optional<int32_t> selected_beam_idx
 ) {
     std::vector<GenerationHandle> generations;
     for (SequenceGroup::Ptr sequence_group : sequence_groups) {
@@ -57,20 +52,26 @@ EncodedResults get_lm_encoded_results(
 
     // Initialize inputs
     if (m_embedding.has_value())
-        m_model_runner.set_tensor("inputs_embeds", input_ids);
+        m_llm.set_tensor("inputs_embeds", input_ids);
     else
-        m_model_runner.set_tensor("input_ids", input_ids);
+        m_llm.set_tensor("input_ids", input_ids);
 
-    m_model_runner.set_tensor("attention_mask", attention_mask);
+    m_llm.set_tensor("attention_mask", attention_mask);
     
     if (position_ids.has_value())
-        m_model_runner.set_tensor("position_ids", *position_ids);
+        m_llm.set_tensor("position_ids", *position_ids);
 
-    m_model_runner.get_tensor("beam_idx").set_shape({ batch_size });
-    std::fill_n(m_model_runner.get_tensor("beam_idx").data<int32_t>(), batch_size, 0);
+    m_llm.get_tensor("beam_idx").set_shape({ batch_size });
+    ov::Tensor beam_idx = ov::Tensor(ov::element::i32, {batch_size});
+    auto beam_data = beam_idx.data<int32_t>();
+    if (selected_beam_idx.has_value())
+        beam_data[0] = *selected_beam_idx;
+    else
+        std::fill_n(beam_data, batch_size, 0);
+    m_llm.set_tensor("beam_idx", beam_idx);
 
     const auto infer_start = std::chrono::steady_clock::now();
-    m_model_runner.infer();
+    m_llm.infer();
     const auto infer_end = std::chrono::steady_clock::now();
     const auto infer_ms = PerfMetrics::get_microsec(infer_end - infer_start);
     raw_perf_counters.m_inference_durations[0] += MicroSeconds(infer_ms);
@@ -78,35 +79,41 @@ EncodedResults get_lm_encoded_results(
     raw_perf_counters.m_new_token_times.emplace_back(infer_end);
     raw_perf_counters.m_batch_sizes.emplace_back(batch_size);
 
-    auto logits = m_model_runner.get_tensor("logits");
+    auto logits = m_llm.get_tensor("logits");
 
     int64_t sequence_len = logits.get_shape().at(1);
     for (auto& sequence_group : sequence_groups)
         sequence_group->schedule_tokens(sequence_len);
 
+    std::map<size_t, size_t> beam_offets;
+    for (size_t i = 0; i < sequence_groups.size(); i++)
+        beam_offets.insert({sequence_groups.at(i)->get_request_id(), i});
+
     SamplerOutput sampler_output = sampler.sample(sequence_groups, logits);
     
-    if (m_embedding.has_value() && hidden_size.has_value()) {
-        m_model_runner.get_tensor("inputs_embeds").set_shape({ batch_size, 1, *hidden_size });
-        m_model_runner.get_tensor("position_ids").set_shape({ batch_size, 1 });
+    if (m_embedding.has_value()) {
+        auto hidden_size = (*m_embedding).get_output_tensor().get_shape().at(2);
+        m_llm.get_tensor("inputs_embeds").set_shape({ batch_size, 1, hidden_size });
+        m_llm.get_tensor("position_ids").set_shape({ batch_size, 1 });
     }
 
-    bool should_continue = std::none_of(sequence_groups.begin(), sequence_groups.end(), [](SequenceGroup::CPtr sg) { return sg->has_finished(); });
-    
-    while (should_continue) {
-        size_t num_sequence_groups = sequence_groups.size();
-        size_t batch_size_in_sequences = 0;
-        size_t total_num_tokens = 0;
-        size_t max_context_len_val = 0;
+    auto active_sequence_groups{sequence_groups};
+    auto get_active_sequence_groups = [](SequenceGroup::Ptr sg) { return sg->has_finished(); };
 
-        for (auto& sequence_group : sequence_groups) {
+    active_sequence_groups.erase(std::remove_if(active_sequence_groups.begin(),
+                                                active_sequence_groups.end(),
+                                                get_active_sequence_groups),
+                                 active_sequence_groups.end());
+
+    while (active_sequence_groups.size() > 0) {
+        size_t total_num_tokens = 0;
+
+        for (auto& sequence_group : active_sequence_groups) {
             sequence_group->schedule_tokens(1);
 
             // compute aggregated values
             size_t num_sequences = sequence_group->num_running_seqs();
-            batch_size_in_sequences += num_sequences;
             total_num_tokens += sequence_group->get_num_scheduled_tokens() * num_sequences;
-            max_context_len_val = std::max(max_context_len_val, sequence_group->get_context_len());
         }
 
         ov::Tensor
@@ -120,7 +127,8 @@ EncodedResults get_lm_encoded_results(
         int32_t
             * beam_idx_data = new_beam_idx.data<int32_t>();
 
-        for (auto& sequence_group : sequence_groups) {
+        size_t beam_offset = 0;
+        for (auto& sequence_group : active_sequence_groups) {
             std::vector<Sequence::Ptr> running_sequences = sequence_group->get_running_sequences();
             size_t num_running_sequences = running_sequences.size();
             size_t num_scheduled_tokens = sequence_group->get_num_scheduled_tokens();
@@ -144,8 +152,18 @@ EncodedResults get_lm_encoded_results(
             }
 
             std::vector<int32_t> beam_idxs = sampler.get_beam_idxs(sequence_group);
+            // for different sequences iteration of beams started from 0, but we collect it to one input_ids
+            std::transform(std::begin(beam_idxs), std::end(beam_idxs), std::begin(beam_idxs), [&beam_offets, sequence_group](int x){ return x + beam_offets.at(sequence_group->get_request_id()); });
             copy(beam_idxs.begin(), beam_idxs.end(), beam_idx_data);
             beam_idx_data += beam_idxs.size();
+        }
+
+        for (size_t i = 0; i < sequence_groups.size(); i++) {
+            if (i == 0)
+                beam_offets[sequence_groups.at(i)->get_request_id()] = 0;
+            else {
+                beam_offets[sequence_groups.at(i)->get_request_id()] = sequence_groups.at(i - 1)->get_running_sequences().size() + beam_offets[i -1];
+            }
         }
 
         if (m_embedding.has_value() && scale_emb.has_value()) {
@@ -159,28 +177,32 @@ EncodedResults get_lm_encoded_results(
                 embed_data[idx] = embed_data[idx] * *scale_emb;
             }
 
-            m_model_runner.set_tensor("inputs_embeds", embed_prompt_tensor);
+            m_llm.get_tensor("inputs_embeds").set_shape(embed_prompt_tensor.get_shape());
+            m_llm.set_tensor("inputs_embeds", embed_prompt_tensor);
         } else {
-            m_model_runner.set_tensor("input_ids", new_input_ids);
+            m_llm.get_tensor("position_ids").set_shape(new_input_ids.get_shape());
+            m_llm.set_tensor("input_ids", new_input_ids);
         }
 
-        m_model_runner.get_tensor("attention_mask").set_shape({ total_num_tokens, m_model_runner.get_tensor("attention_mask").get_shape()[1] + 1 });
-        std::fill_n(m_model_runner.get_tensor("attention_mask").data<int64_t>(), m_model_runner.get_tensor("attention_mask").get_size(), 1);
+        m_llm.get_tensor("attention_mask").set_shape({ total_num_tokens, m_llm.get_tensor("attention_mask").get_shape()[1] + 1 });
+        std::fill_n(m_llm.get_tensor("attention_mask").data<int64_t>(), m_llm.get_tensor("attention_mask").get_size(), 1);
 
-        if (position_ids.has_value())
-            m_model_runner.set_tensor("position_ids", new_position_ids);
+        if (position_ids.has_value()) {
+            m_llm.get_tensor("position_ids").set_shape(new_position_ids.get_shape());
+            m_llm.set_tensor("position_ids", new_position_ids);
+        }
 
-        m_model_runner.set_tensor("beam_idx", new_beam_idx);
+        m_llm.get_tensor("beam_idx").set_shape(new_beam_idx.get_shape());
+        m_llm.set_tensor("beam_idx", new_beam_idx);
 
         const auto infer_start = std::chrono::steady_clock::now();
-        m_model_runner.infer();
+        m_llm.infer();
         const auto infer_end = std::chrono::steady_clock::now();
         const auto infer_ms = PerfMetrics::get_microsec(infer_end - infer_start);
         raw_perf_counters.m_inference_durations[0] += MicroSeconds(infer_ms);
         raw_perf_counters.m_token_infer_durations.emplace_back(infer_ms);
         raw_perf_counters.m_new_token_times.emplace_back(infer_end);
         raw_perf_counters.m_batch_sizes.emplace_back(batch_size);
-
 
         if (streamer_ptr) {
             // stream data from first sequence
@@ -190,16 +212,17 @@ EncodedResults get_lm_encoded_results(
             }
         }
 
-        sampler_output = sampler.sample(sequence_groups, m_model_runner.get_tensor("logits"));
+        sampler_output = sampler.sample(active_sequence_groups, m_llm.get_tensor("logits"));
 
-        should_continue = std::none_of(sequence_groups.begin(), sequence_groups.end(), [](SequenceGroup::CPtr sg) { return sg->has_finished(); });
+        active_sequence_groups.erase(std::remove_if(active_sequence_groups.begin(),
+                                                    active_sequence_groups.end(),
+                                                    get_active_sequence_groups),
+                                    active_sequence_groups.end());
     }
 
     if (streamer_ptr) {
         streamer_ptr->end();
     }
-
-    // reset_all_inputs_to_empty_tensors(m_model_runner);
 
     for (size_t i = 0; i < sequence_groups.size(); i++) {
         auto request = sequence_groups[i];

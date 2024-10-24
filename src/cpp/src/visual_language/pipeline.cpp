@@ -127,7 +127,7 @@ public:
         std::iota(position_ids.data<int64_t>(), position_ids.data<int64_t>() + position_ids.get_size(), history_size);
 
         ov::genai::EncodedResults encoded_result = ov::genai::get_lm_encoded_results(m_language, inputs_embeds, new_atten_mask, streamer_ptr, sampler, requests,
-                                                                                     position_ids, m_embedding, m_vlm_config.hidden_size, m_vlm_config.scale_emb);
+                                                                                     position_ids, m_embedding, m_vlm_config.scale_emb, std::nullopt);
 
         DecodedResults decoded;
         for (size_t idx = 0; idx < encoded_result.tokens.size(); ++idx) {

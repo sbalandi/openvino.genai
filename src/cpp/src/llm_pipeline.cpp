@@ -247,6 +247,7 @@ public:
         size_t block_size = 1;
         bool enable_prefix_caching = false;
 
+        config.stop_token_ids.insert(config.eos_token_id);
         for (size_t request_id = 0; request_id < batch_size; request_id++) {
             SequenceGroup::Ptr sequence_group;
             if (is_chat_conversation && !m_is_cache_empty) {
@@ -269,7 +270,7 @@ public:
 
         ov::genai::EncodedResults result;
         result = ov::genai::get_lm_encoded_results(m_model_runner, input_ids, concatenated_attention_mask, streamer_ptr,
-                                                   sampler, requests, position_ids, std::nullopt, std::nullopt, std::nullopt);
+                                                   sampler, requests, position_ids, std::nullopt, std::nullopt, m_selected_beam);
 
         auto beams = sampler.get_beam_idxs(requests.at(0));
         m_selected_beam = beams.empty() ? 0 : beams.at(0);
