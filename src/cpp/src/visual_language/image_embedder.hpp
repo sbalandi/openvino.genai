@@ -11,6 +11,7 @@
 #include "openvino/runtime/tensor.hpp"
 #include "openvino/runtime/infer_request.hpp"
 #include "visual_language/vlm_config.hpp"
+#include "visual_language/embedding_model.hpp"
 
 namespace ov::genai {
 
@@ -24,11 +25,8 @@ public:
     // compute input embedding for prompt and multiple images
     ov::Tensor get_inputs_embeds(const std::string& prompt, const std::vector<ov::Tensor>& images);
 
-    // compute input embedding for next token
-    ov::Tensor get_inputs_embeds(ov::Tensor input_ids);
-
     // returns embedding model which converts token_id(s) to embedding vectors
-    ov::InferRequest get_embedding_model() const;
+    std::shared_ptr<EmbeddingsModel> get_embedding_model() const;
 
     // returns tokenizer
     Tokenizer get_tokenizer() const;

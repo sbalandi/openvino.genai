@@ -9,6 +9,7 @@
 
 #include "visual_language/vlm_config.hpp"
 #include "visual_language/image_embedder.hpp"
+#include "visual_language/embedding_model.hpp"
 
 #include "sampler.hpp"
 #include "text_callback_streamer.hpp"
@@ -25,7 +26,7 @@ constexpr size_t BATCH_SIZE = 1;
 
 EncodedGenerationResult get_lm_encoded_results(
     ov::InferRequest& language,
-    const std::shared_ptr<InputsEmbedder>& embedder,
+    std::shared_ptr<EmbeddingsModel>& embeding,
     const ov::Tensor& inputs_embeds,
     const std::shared_ptr<StreamerBase>& streamer_ptr,
     Sampler& sampler,
@@ -53,7 +54,7 @@ EncodedGenerationResult get_lm_encoded_results(
 
     sampler.sample(requests, language.get_tensor("logits"));
 
-    auto hidden_size = embedder->get_embedding_model().get_output_tensor().get_shape()[2];
+    auto hidden_size = inputs_embeds.get_shape()[2];
     language.get_tensor("inputs_embeds").set_shape({BATCH_SIZE, 1, hidden_size});
     language.get_tensor("position_ids").set_shape({ BATCH_SIZE, 1 });
 
@@ -86,8 +87,8 @@ EncodedGenerationResult get_lm_encoded_results(
             input_ids_data += num_scheduled_tokens;
             position_ids_data += num_scheduled_tokens;
         }
-
-        const ov::Tensor& embed_prompt_tensor = embedder->get_inputs_embeds(input_ids);
+        
+        const ov::Tensor& embed_prompt_tensor = embeding->infer(input_ids);
 
         language.set_tensor("inputs_embeds", embed_prompt_tensor);
 
@@ -149,7 +150,7 @@ public:
     // A model to compute token embeddings.
     // Input shape: [N, conversation length].
     // Output shape: [1, conversation length, hidden_size].
-    ov::InferRequest m_embedding;
+    std::shared_ptr<EmbeddingsModel> m_embedding;
     // A language model used to generate a response.
     // Input shapes: inputs_embeds[N, conversation length, hidden_size],
     // position_ids[N, conversation length], beam_idx[N].
@@ -231,7 +232,7 @@ public:
         OPENVINO_ASSERT((generation_config.is_greedy_decoding() || generation_config.is_multinomial() || !streamer_ptr),
                         "Currently streaming is possible only for greedy or multinomial decoding");
 
-        EncodedGenerationResult encoded_result = get_lm_encoded_results(m_language, m_inputs_embedder, inputs_embeds, streamer_ptr, sampler, requests);
+        EncodedGenerationResult encoded_result = get_lm_encoded_results(m_language, m_embedding, inputs_embeds, streamer_ptr, sampler, requests);
 
         DecodedResults decoded;
         for (size_t idx = 0; idx < encoded_result.m_generation_ids.size(); ++idx) {
