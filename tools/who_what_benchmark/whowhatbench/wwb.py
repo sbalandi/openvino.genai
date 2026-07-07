@@ -106,6 +106,8 @@ def parse_args():
             "image-to-image",
             "image-inpainting",
             "text-embedding",
+            "image-embedding",
+            "video-embedding",
             "text-reranking",
         ],
         default="text",
@@ -819,9 +821,34 @@ def genai_gen_visual_text_chat(
     return answers
 
 
-def genai_gen_embedding(model, tokenizer, passages, **kwargs):
-    embeddings = model.embed_documents(passages)
-    return embeddings
+def genai_gen_embedding(model, tokenizer, processor, texts, images, videos_info, prompt, **kwargs):
+    text_input = []
+    if texts is not None:
+        text_input.append(texts)
+
+    media_inputs = {}
+
+    if prompt:
+        media_inputs["embedding_prompt"] = prompt[0]
+
+    if images is not None:
+        media_inputs["images"] = []
+        for im in images:
+            media_inputs["images"].append(ov.Tensor(np.array(im)))
+
+    videos, videos_metadata = videos_info.values()
+    if videos is not None:
+        media_inputs["videos"] = []
+        for i, video in enumerate(videos):
+            import openvino_genai
+
+            media_inputs["videos"].append(ov.Tensor(np.stack(video, axis=0)))
+            video_metadata = openvino_genai.VideoMetadata()
+            video_metadata.fps = videos_metadata[i]["fps"]
+            video_metadata.frames_indices = range(10)
+            media_inputs["videos_metadata"] = [video_metadata]
+
+    return np.asarray(model.embed(*text_input, **media_inputs).embeddings.data, dtype=np.float32)
 
 
 def genai_gen_reranking(model, tokenizer, query, documents):
@@ -964,10 +991,18 @@ def create_evaluator(base_model, args):
                 is_genai=args.genai,
                 seed=args.seed,
             )
-        elif task == "text-embedding":
+        elif task == "text-embedding" or task == "image-embedding" or task == "video-embedding":
+            if task == "image-embedding" or task == "video-embedding":
+                processor, config = load_processor(args)
+                tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else load_tokenizer(args)
+            else:
+                processor = None
+                tokenizer = load_tokenizer(args)
+
             return EvaluatorCLS(
                 base_model=base_model,
-                tokenizer=load_tokenizer(args),
+                processor=processor,
+                tokenizer=tokenizer,
                 gt_data=args.gt_data,
                 test_data=prompts,
                 num_samples=args.num_samples,
@@ -976,6 +1011,7 @@ def create_evaluator(base_model, args):
                 normalize=args.embeds_normalize,
                 padding_side=args.embeds_padding_side,
                 batch_size=args.embeds_batch_size,
+                pipeline_type=args.model_type,
             )
         elif task == "text-reranking":
             return EvaluatorCLS(
